@@ -460,7 +460,13 @@ def main():
     print("   AliExpress Product Scraper 🛒")
     print("=" * 50)
 
-    url, count = ask_user_inputs()
+    # يمكن تمرير الرابط والعدد مباشرة لتخطي الأسئلة:
+    #   python scraper.py <الرابط> <العدد>
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
+    if len(args) >= 2 and args[0].startswith("http") and args[1].isdigit():
+        url, count = args[0], int(args[1])
+    else:
+        url, count = ask_user_inputs()
 
     start = time.time()
     with sync_playwright() as playwright:
