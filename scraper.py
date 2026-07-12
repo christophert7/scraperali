@@ -303,9 +303,37 @@ def ask_user_inputs():
 # التصفح والاستخراج
 # ---------------------------------------------------------------------------
 
+def launch_browser(playwright):
+    """
+    تشغيل المتصفح مع خطط بديلة:
+      1) متصفح Chromium الخاص بـ Playwright (إن كان منزّلاً).
+      2) Google Chrome المثبت على الجهاز.
+      3) Microsoft Edge (موجود افتراضياً في كل أجهزة ويندوز).
+    بهذا يعمل البرنامج حتى لو فشل أمر: playwright install chromium
+    """
+    attempts = [
+        ("Playwright Chromium", {}),
+        ("Google Chrome", {"channel": "chrome"}),
+        ("Microsoft Edge", {"channel": "msedge"}),
+    ]
+    last_error = None
+    for label, opts in attempts:
+        try:
+            browser = playwright.chromium.launch(headless=HEADLESS, **opts)
+            print(f"🌐 المتصفح المستخدم: {label}")
+            return browser
+        except Exception as exc:
+            last_error = exc
+    raise RuntimeError(
+        "تعذر تشغيل أي متصفح. ثبّت Google Chrome أو Microsoft Edge، "
+        "أو نفّذ: playwright install chromium\n"
+        f"تفاصيل آخر خطأ: {last_error}"
+    )
+
+
 def open_page(playwright, url: str):
     """فتح المتصفح والانتقال إلى الصفحة المطلوبة."""
-    browser = playwright.chromium.launch(headless=HEADLESS)
+    browser = launch_browser(playwright)
     context = browser.new_context(
         user_agent=USER_AGENT,
         viewport={"width": 1366, "height": 900},

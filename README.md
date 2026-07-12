@@ -42,6 +42,10 @@ pip install -r requirements.txt
 playwright install chromium
 ```
 
+> 💡 **إذا فشل تنزيل المتصفح** (خطأ `ECONNRESET` أو انقطاع الاتصال)، لا مشكلة —
+> الأداة ستستخدم تلقائياً **Google Chrome** أو **Microsoft Edge** المثبت على جهازك،
+> فيمكنك تخطي الخطوة 2 والتشغيل مباشرة.
+
 ---
 
 ## 🚀 طريقة التشغيل
