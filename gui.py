@@ -131,9 +131,9 @@ class ScraperApp:
         try:
             scraper.HEADLESS = headless
             with sync_playwright() as p:
-                browser, page = scraper.open_page(p, url)
+                browser, page, sniffed = scraper.open_page(p, url)
                 try:
-                    products = scraper.collect_products(page, count)
+                    products = scraper.collect_products(page, count, sniffed)
                 finally:
                     browser.close()
 

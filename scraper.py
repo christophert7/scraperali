@@ -70,6 +70,16 @@ USER_AGENT = (
 
 EXTRACT_JS = r"""
 () => {
+    // --- التعرف على روابط المنتجات بعدة أنماط (وليس /item/ فقط) ---
+    const ITEM_RE = /(?:\/item\/|\/i\/)(\d{5,})|[?&](?:productId|itemId|objectId)=(\d{5,})/;
+    const getId = (el) => {
+        const href = (el && el.href) || '';
+        const m = href.match(ITEM_RE);
+        return m ? (m[1] || m[2]) : null;
+    };
+    const productLinks = (root) =>
+        [...root.querySelectorAll('a[href]')].filter(a => getId(a));
+
     // --- Selectors احتياطية لبطاقات المنتجات (تُجرَّب بالترتيب) ---
     const CARD_SELECTORS = [
         'div.search-item-card-wrapper-gallery',   // نتائج البحث (شبكة)
@@ -117,23 +127,20 @@ EXTRACT_JS = r"""
     for (const sel of CARD_SELECTORS) {
         const found = document.querySelectorAll(sel);
         // نتأكد أن البطاقات تحتوي فعلاً على روابط منتجات
-        const valid = [...found].filter(c =>
-            (c.matches && c.matches('a[href*="/item/"]')) ||
-            c.querySelector('a[href*="/item/"]'));
+        const valid = [...found].filter(c => getId(c) || productLinks(c).length);
         if (valid.length >= 3) { cards = valid; break; }
     }
 
-    // --- خطة بديلة عامة: نبدأ من روابط "/item/" ونصعد للحاوية ---
+    // --- خطة بديلة عامة: نبدأ من روابط المنتجات ونصعد للحاوية ---
     if (cards.length === 0) {
         const seen = new Set();
-        for (const a of document.querySelectorAll('a[href*="/item/"]')) {
+        for (const a of productLinks(document)) {
             // نصعد حتى نجد حاوية معقولة الحجم (بطاقة منتج)
             let node = a, card = a;
             for (let i = 0; i < 6 && node.parentElement; i++) {
                 node = node.parentElement;
-                const links = node.querySelectorAll('a[href*="/item/"]');
                 // إذا أصبحت الحاوية تضم أكثر من منتج فقد تجاوزنا حدود البطاقة
-                const ids = new Set([...links].map(l => (l.href.match(/item\/(\d+)/) || [])[1]));
+                const ids = new Set(productLinks(node).map(getId));
                 if (ids.size > 1) break;
                 card = node;
             }
@@ -146,13 +153,11 @@ EXTRACT_JS = r"""
     for (const card of cards) {
         try {
             // رابط المنتج
-            const link = card.matches && card.matches('a[href*="/item/"]')
-                ? card
-                : card.querySelector('a[href*="/item/"]');
+            const link = getId(card) ? card : productLinks(card)[0];
             if (!link) continue;
             const href = link.href || '';
-            const idMatch = href.match(/item\/(\d+)/);
-            if (!idMatch) continue;
+            const pid = getId(link);
+            if (!pid) continue;
 
             const text = card.innerText || '';
 
@@ -177,7 +182,7 @@ EXTRACT_JS = r"""
             }
 
             results.push({
-                id: idMatch[1],
+                id: pid,
                 name: name,
                 url: href,
                 image: image,
@@ -279,6 +284,163 @@ def clean_record(raw: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# الطبقة الثالثة: التقاط بيانات المنتجات من استجابات الشبكة (JSON)
+# صفحات الحملات (SuperDeals / BundleDeals / Choice / best.aliexpress.com)
+# ترسم البطاقات بجافاسكريبت وتجلب البيانات عبر طلبات API داخلية،
+# لذلك نلتقط تلك الاستجابات مباشرة — وهذا يعمل حتى لو لم توجد روابط في الصفحة.
+# ---------------------------------------------------------------------------
+
+_ID_KEYS = {"productid", "itemid", "productidstr", "itemidstr", "objectid"}
+_TITLE_KEYS = {"title", "subject", "producttitle", "itemtitle", "displaytitle", "name"}
+
+
+def parse_maybe_jsonp(body: str):
+    """تحويل نص JSON أو JSONP (مثل mtopjsonp1({...})) إلى كائن بايثون."""
+    body = body.strip()
+    try:
+        return json.loads(body)
+    except (ValueError, TypeError):
+        pass
+    m = re.match(r"^[\w$.]+\s*\(\s*(\{.*\})\s*\)\s*;?$", body, re.S)
+    if m:
+        try:
+            return json.loads(m.group(1))
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def harvest_json_products(obj, bucket: list, depth: int = 0):
+    """البحث المتكرر داخل JSON عن كائنات تشبه المنتجات (معرّف + عنوان)."""
+    if depth > 12:
+        return
+    if isinstance(obj, dict):
+        pid = title = None
+        for k, v in obj.items():
+            kl = k.lower()
+            if kl in _ID_KEYS and isinstance(v, (str, int)) and re.fullmatch(r"\d{5,}", str(v)):
+                pid = str(v)
+            elif kl in _TITLE_KEYS and isinstance(v, str) and len(v.strip()) > 5:
+                title = v.strip()
+        if pid and title:
+            bucket.append((pid, title, obj))
+        for v in obj.values():
+            if isinstance(v, (dict, list)):
+                harvest_json_products(v, bucket, depth + 1)
+    elif isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, (dict, list)):
+                harvest_json_products(v, bucket, depth + 1)
+
+
+def _iter_pairs(obj, depth: int = 0):
+    """المرور على كل أزواج (اسم الحقل، القيمة) داخل كائن JSON متداخل."""
+    if depth > 10:
+        return
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                yield from _iter_pairs(v, depth + 1)
+            elif isinstance(v, (str, int, float)) and not isinstance(v, bool):
+                yield k.lower(), str(v)
+    elif isinstance(obj, list):
+        for v in obj:
+            if isinstance(v, (dict, list)):
+                yield from _iter_pairs(v, depth + 1)
+            elif isinstance(v, (str, int, float)) and not isinstance(v, bool):
+                yield "", str(v)
+
+
+def sniffed_to_record(pid: str, title: str, obj: dict) -> dict:
+    """تحويل كائن منتج ملتقط من الشبكة إلى سجل نهائي بنفس الأعمدة."""
+    pairs = list(_iter_pairs(obj))
+
+    def first(cond):
+        for k, v in pairs:
+            v = v.strip()
+            if v and cond(k, v):
+                return k, v
+        return "", ""
+
+    # الصورة: أي رابط لخوادم صور AliExpress
+    _, image = first(lambda k, v: "alicdn.com" in v)
+    if image.startswith("//"):
+        image = "https:" + image
+
+    # السعر: نفضل الحقول التي يوحي اسمها بالسعر، ثم أي قيمة بنمط سعر
+    _, price = first(lambda k, v: ("price" in k or "amount" in k) and PRICE_RE.search(v))
+    if not price:
+        _, price = first(lambda k, v: bool(PRICE_RE.search(v)))
+    if price:
+        price = PRICE_RE.search(price).group(0).strip()
+
+    # الخصم
+    _, discount = first(lambda k, v: "discount" in k and re.fullmatch(r"-?\d{1,2}%?", v))
+    if discount:
+        discount = discount.lstrip("-")
+        if not discount.endswith("%"):
+            discount += "%"
+
+    # الطلبات / المبيعات
+    _, orders = first(lambda k, v: any(s in k for s in ("sold", "order", "trade")) and re.search(r"\d", v))
+    if orders:
+        m = ORDERS_RE.search(orders)
+        if m:
+            orders = m.group(1).strip()
+        else:
+            m = re.search(r"\d[\d.,]*\s?[KkMm]?\+?", orders)
+            orders = m.group(0).strip() if m else ""
+
+    # التقييم
+    _, rating = first(
+        lambda k, v: any(s in k for s in ("rating", "star", "evaluat"))
+        and re.fullmatch(r"[0-5](\.\d+)?", v)
+    )
+
+    # المتجر
+    _, store = first(lambda k, v: any(s in k for s in ("storename", "shopname", "sellername")))
+
+    return {
+        "Product Name": title,
+        "Price": price,
+        "Product URL": f"https://www.aliexpress.com/item/{pid}.html",
+        "Image URL": image,
+        "Store": store,
+        "Discount": discount,
+        "Orders": orders,
+        "Rating": rating,
+    }
+
+
+def attach_network_sniffer(page, bucket: list):
+    """مراقبة استجابات الشبكة والتقاط أي بيانات منتجات فيها."""
+
+    def on_response(response):
+        try:
+            if response.request.resource_type not in ("xhr", "fetch", "script"):
+                return
+            body = response.text()
+            if not body or len(body) > 3_000_000:
+                return
+            # تصفية سريعة قبل التحليل الكامل
+            if "roductId" not in body and "temId" not in body:
+                return
+            data = parse_maybe_jsonp(body)
+            if data is not None:
+                harvest_json_products(data, bucket)
+        except Exception:
+            pass  # فشل قراءة استجابة واحدة لا يوقف البرنامج
+
+    page.on("response", on_response)
+
+
+def product_key(url: str) -> str:
+    """مفتاح إزالة التكرار: معرّف المنتج إن وجد في الرابط."""
+    m = re.search(r"(\d{5,})", url)
+    return m.group(1) if m else url
+
+
+# ---------------------------------------------------------------------------
 # إدخال المستخدم
 # ---------------------------------------------------------------------------
 
@@ -332,7 +494,7 @@ def launch_browser(playwright):
 
 
 def open_page(playwright, url: str):
-    """فتح المتصفح والانتقال إلى الصفحة المطلوبة."""
+    """فتح المتصفح والانتقال إلى الصفحة المطلوبة مع تفعيل التقاط بيانات الشبكة."""
     browser = launch_browser(playwright)
     context = browser.new_context(
         user_agent=USER_AGENT,
@@ -340,50 +502,73 @@ def open_page(playwright, url: str):
         locale="en-US",
     )
     page = context.new_page()
+    # التقاط بيانات المنتجات من طلبات JSON الداخلية (مهم لصفحات الحملات)
+    sniffed = []
+    attach_network_sniffer(page, sniffed)
     print("⏳ جاري فتح الصفحة ...")
     page.goto(url, timeout=90_000, wait_until="domcontentloaded")
     # ننتظر قليلاً حتى تنفذ الصفحة الـ JavaScript وتعرض المنتجات
-    page.wait_for_timeout(5000)
-    return browser, page
+    page.wait_for_timeout(6000)
+    return browser, page, sniffed
 
 
-def collect_products(page, target_count: int) -> list:
+def collect_products(page, target_count: int, sniffed: list = None) -> list:
     """
-    جمع المنتجات مع التمرير التلقائي (Lazy Loading / Infinite Scroll)
+    جمع المنتجات من ثلاث طبقات:
+      1) بطاقات الصفحة (DOM) في الصفحة الرئيسية وكل الإطارات (iframes).
+      2) بيانات JSON الملتقطة من طلبات الشبكة (sniffed).
+    مع التمرير التلقائي (Lazy Loading / Infinite Scroll)
     حتى الوصول للعدد المطلوب أو انتهاء محتوى الصفحة.
     """
-    products = {}          # المفتاح: الرابط الموحّد -> إزالة التكرار تلقائياً
+    products = {}          # المفتاح: معرّف المنتج -> إزالة التكرار تلقائياً
     last_reported = 0      # لعرض التقدم دون تكرار نفس السطر
     stagnant_rounds = 0    # عدد جولات التمرير بدون منتجات جديدة
 
-    for _ in range(MAX_SCROLL_ROUNDS):
-        # استخراج كل المنتجات الظاهرة حالياً في الصفحة
-        try:
-            raw_items = page.evaluate(EXTRACT_JS)
-        except Exception as exc:
-            print(f"⚠️  خطأ أثناء الاستخراج، سنعيد المحاولة: {exc}")
-            page.wait_for_timeout(2000)
-            continue
+    def add_record(record):
+        """إضافة سجل مع إزالة التكرار حسب معرّف المنتج."""
+        if not record["Product Name"] or not record["Product URL"]:
+            return
+        key = product_key(record["Product URL"])
+        if key not in products and len(products) < target_count:
+            products[key] = record
 
+    for round_no in range(MAX_SCROLL_ROUNDS):
         before = len(products)
+
+        # الطبقة 1: استخراج بطاقات الصفحة من كل الإطارات
+        raw_items = []
+        for frame in page.frames:
+            try:
+                raw_items.extend(frame.evaluate(EXTRACT_JS))
+            except Exception:
+                continue  # إطار لم يكتمل تحميله -> نتجاوزه
+
         for raw in raw_items:
             if len(products) >= target_count:
                 break
             try:
-                record = clean_record(raw)
-                # نتجاهل السجلات بدون اسم أو رابط (عناصر غير منتجات)
-                if not record["Product Name"] or not record["Product URL"]:
-                    continue
-                key = record["Product URL"]
-                if key not in products:
-                    products[key] = record
+                add_record(clean_record(raw))
             except Exception:
                 # خطأ في منتج واحد -> نتجاوزه ونكمل
                 continue
 
+        # الطبقة 2: المنتجات الملتقطة من استجابات الشبكة (JSON)
+        if sniffed:
+            seen_ids = set()
+            for pid, title, obj in list(sniffed):
+                if len(products) >= target_count:
+                    break
+                if pid in seen_ids:
+                    continue
+                seen_ids.add(pid)
+                try:
+                    add_record(sniffed_to_record(pid, title, obj))
+                except Exception:
+                    continue
+
         # عرض التقدم كل 20 منتجاً جديداً تقريباً
         current = len(products)
-        if current - last_reported >= 20 or current >= target_count:
+        if current - last_reported >= 20 or (current and current >= target_count):
             print(f"تم استخراج {min(current, target_count)} من {target_count}")
             last_reported = current
 
@@ -392,13 +577,15 @@ def collect_products(page, target_count: int) -> list:
 
         # هل أضفنا منتجات جديدة في هذه الجولة؟
         stagnant_rounds = stagnant_rounds + 1 if current == before else 0
-        if stagnant_rounds >= 5:
+        if current == 0 and stagnant_rounds == 3:
+            print("⏳ الصفحة بطيئة أو ما زالت تُحمّل — نواصل الانتظار والتمرير ...")
+        if stagnant_rounds >= 8:
             print("ℹ️  لا توجد منتجات جديدة بعد عدة محاولات تمرير — نكتفي بما جُمع.")
             break
 
         # التمرير للأسفل لتحميل المزيد من المنتجات
         page.mouse.wheel(0, 2500)
-        page.wait_for_timeout(1500)
+        page.wait_for_timeout(2000)
 
         # بعض الصفحات تستخدم زر "عرض المزيد" بدلاً من التمرير اللانهائي
         try:
@@ -470,9 +657,9 @@ def main():
 
     start = time.time()
     with sync_playwright() as playwright:
-        browser, page = open_page(playwright, url)
+        browser, page, sniffed = open_page(playwright, url)
         try:
-            products = collect_products(page, count)
+            products = collect_products(page, count, sniffed)
         finally:
             browser.close()
 
