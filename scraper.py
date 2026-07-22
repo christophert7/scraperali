@@ -70,13 +70,59 @@ USER_AGENT = (
 
 EXTRACT_JS = r"""
 () => {
-    // --- التعرف على روابط المنتجات بعدة أنماط (وليس /item/ فقط) ---
-    const ITEM_RE = /(?:\/item\/|\/i\/)(\d{5,})|[?&](?:productId|itemId|objectId)=(\d{5,})/;
-    const getId = (el) => {
-        const href = (el && el.href) || '';
+    // --- معرّفات موجودة في رابط الصفحة نفسها (معرّف الحملة مثل 300000512) ---
+    // نستبعدها حتى لا تُستخدم كمعرّف منتج فيتحول رابط كل المنتجات إلى رابط الحملة الموحّد.
+    const pageIds = new Set(
+        ((location.pathname + location.search).match(/\d{5,}/g) || [])
+    );
+
+    // --- استخراج معرّف المنتج من رابط: يدعم /item/ و /i/ ومعاملات productId ---
+    const ITEM_RE = /(?:\/item\/|\/i\/)(\d{6,})|[?&](?:productId|itemId|objectId|product_id|item_id)=(\d{6,})/i;
+    const idFromHref = (href) => {
+        if (!href) return null;
         const m = href.match(ITEM_RE);
-        return m ? (m[1] || m[2]) : null;
+        const id = m ? (m[1] || m[2]) : null;
+        return (id && !pageIds.has(id)) ? id : null;
     };
+
+    // --- إيجاد معرّف منتج حقيقي لبطاقة واحدة من عدة مصادر بالترتيب ---
+    const DATA_ID_ATTRS = [
+        'data-product-id', 'data-productid', 'data-item-id', 'data-itemid',
+        'data-p-id', 'data-pid', 'data-id', 'data-spm-anchor-id',
+    ];
+    const findProductId = (card) => {
+        if (!card) return null;
+        // 1) البطاقة نفسها إن كانت رابطاً
+        if (card.tagName === 'A') {
+            const id = idFromHref(card.href);
+            if (id) return id;
+        }
+        // 2) أي رابط منتج داخل البطاقة
+        for (const a of card.querySelectorAll('a[href]')) {
+            const id = idFromHref(a.href);
+            if (id) return id;
+        }
+        // 3) خصائص data-* التي تحمل المعرّف
+        const candidates = [card, ...card.querySelectorAll('[' + DATA_ID_ATTRS.join('],[') + ']')];
+        for (const el of candidates) {
+            if (!el.getAttribute) continue;
+            for (const attr of DATA_ID_ATTRS) {
+                const v = (el.getAttribute(attr) || '').match(/\d{6,}/);
+                if (v && !pageIds.has(v[0])) return v[0];
+            }
+        }
+        // 4) مسح HTML البطاقة بحثاً عن productId/itemId (بيانات مضمّنة في JSON)
+        const html = card.outerHTML || '';
+        const re = /(?:"?(?:productId|itemId|product_id|item_id)"?\s*[:=]\s*"?|\/item\/)(\d{9,})/gi;
+        let m;
+        while ((m = re.exec(html))) {
+            if (!pageIds.has(m[1])) return m[1];
+        }
+        return null;
+    };
+
+    // للتوافق مع الكود القديم: معرّف مبني على الرابط فقط
+    const getId = (el) => idFromHref((el && el.href) || '');
     const productLinks = (root) =>
         [...root.querySelectorAll('a[href]')].filter(a => getId(a));
 
@@ -126,8 +172,8 @@ EXTRACT_JS = r"""
     let cards = [];
     for (const sel of CARD_SELECTORS) {
         const found = document.querySelectorAll(sel);
-        // نتأكد أن البطاقات تحتوي فعلاً على روابط منتجات
-        const valid = [...found].filter(c => getId(c) || productLinks(c).length);
+        // نتأكد أن البطاقات تحتوي فعلاً على معرّف منتج قابل للاستخراج
+        const valid = [...found].filter(c => findProductId(c));
         if (valid.length >= 3) { cards = valid; break; }
     }
 
@@ -152,12 +198,10 @@ EXTRACT_JS = r"""
     const results = [];
     for (const card of cards) {
         try {
-            // رابط المنتج
-            const link = getId(card) ? card : productLinks(card)[0];
-            if (!link) continue;
-            const href = link.href || '';
-            const pid = getId(link);
+            // معرّف المنتج الحقيقي (وليس معرّف الحملة) ثم نبني منه رابطاً مباشراً
+            const pid = findProductId(card);
             if (!pid) continue;
+            const href = 'https://www.aliexpress.com/item/' + pid + '.html';
 
             const text = card.innerText || '';
 
@@ -268,13 +312,31 @@ def normalize_url(url: str) -> str:
     return url
 
 
+def build_product_url(raw: dict) -> str:
+    """
+    بناء رابط مباشر لكل منتج.
+    في صفحات الحملات (Bundle/SuperDeals) يكون رابط <a> هو رابط الحملة الموحّد نفسه،
+    لذلك نعتمد على معرّف المنتج (id) لبناء رابط /item/{id}.html خاص بكل منتج.
+    نعود إلى الرابط الخام فقط إذا لم يتوفر المعرّف.
+    """
+    pid = str(raw.get("id", "") or "")
+    if re.fullmatch(r"\d{6,}", pid):
+        return f"https://www.aliexpress.com/item/{pid}.html"
+    url = normalize_url(raw.get("url", ""))
+    # كخطة أخيرة: حاول انتزاع معرّف منتج من الرابط الخام
+    m = re.search(r"(?:/item/|/i/)(\d{6,})", url)
+    if m:
+        return f"https://www.aliexpress.com/item/{m.group(1)}.html"
+    return url
+
+
 def clean_record(raw: dict) -> dict:
     """تحويل البيانات الخام من المتصفح إلى سجل نهائي منظم."""
     text = raw.get("text", "")
     return {
         "Product Name": raw.get("name", "").strip(),
         "Price": parse_price(raw.get("price_raw", ""), text),
-        "Product URL": normalize_url(raw.get("url", "")),
+        "Product URL": build_product_url(raw),
         "Image URL": ("https:" + raw["image"]) if raw.get("image", "").startswith("//") else raw.get("image", ""),
         "Store": raw.get("store", "").strip(),
         "Discount": parse_discount(text),
